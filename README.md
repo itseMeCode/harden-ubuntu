@@ -29,7 +29,7 @@ The script:
 
     curl -O https://raw.githubusercontent.com/itseMeCode/harden-ubuntu.sh
     chmod +x harden-ubuntu.sh
-
+    
 ### 2. Run the script
 
 #### Bastion host (small server)
