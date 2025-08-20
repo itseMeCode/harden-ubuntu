@@ -27,7 +27,7 @@ The script:
 
 ### 1. Download the script
 
-    curl -O https://raw.githubusercontent.com/itseMeCode/harden-ubuntu.sh
+    curl -fsSL -o harden-ubuntu.sh https://raw.githubusercontent.com/itseMeCode/harden-ubuntu/refs/heads/main/harden-ubuntu.sh
     chmod +x harden-ubuntu.sh
     
 ### 2. Run the script
