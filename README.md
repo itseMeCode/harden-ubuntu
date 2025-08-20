@@ -1,7 +1,7 @@
 # Ultimate Ubuntu Hardening Script
 
 This repository provides a **one-script solution** for hardening fresh Ubuntu servers.  
-It can be used for **bastion hosts** (jump boxes) and **general servers** (e.g. web, mail).  
+It can be used for **bastion hosts** (jump boxes) and **general servers** (e.g. web, mail).
 
 The script:
 - Creates a non-root sudo user
@@ -26,102 +26,102 @@ The script:
 ## 🚀 Usage
 
 ### 1. Download the script
-```bash
-curl -O https://raw.githubusercontent.com/<you>/<repo>/harden-ubuntu.sh
-chmod +x harden-ubuntu.sh
-2. Run the script
-Bastion host (small server)
-bash
-Copy
-sudo ./harden-ubuntu.sh \
-  --user admin \
-  --ssh-port 2222 \
-  --generate-key \
-  --role bastion \
-  --enable-crowdsec
-Creates user admin
 
-Sets SSH to port 2222
+    curl -O https://raw.githubusercontent.com/<you>/<repo>/harden-ubuntu.sh
+    chmod +x harden-ubuntu.sh
 
-Generates a new ed25519 keypair (you’ll copy the private key to your workstation)
+### 2. Run the script
 
-Installs CrowdSec for advanced blocking
+#### Bastion host (small server)
 
-General server (e.g. mail/web)
-bash
-Copy
-sudo ./harden-ubuntu.sh \
-  --user admin \
-  --ssh-port 2222 \
-  --role general \
-  --allow-ssh-from <bastion-ip>
-Creates user admin
+    sudo ./harden-ubuntu.sh \
+      --user admin \
+      --ssh-port 2222 \
+      --generate-key \
+      --role bastion \
+      --enable-crowdsec
 
-Sets SSH to port 2222
+- Creates user `admin`
+- Sets SSH to port `2222`
+- Generates a new `ed25519` keypair (you’ll copy the private key to your workstation)
+- Installs CrowdSec for advanced blocking
 
-Only allows SSH from your bastion’s IP
+#### General server (e.g. mail/web)
 
-Opens ports 80/443 (HTTP/HTTPS) by default
+    sudo ./harden-ubuntu.sh \
+      --user admin \
+      --ssh-port 2222 \
+      --role general \
+      --allow-ssh-from <bastion-ip>
 
-🔑 Options
-Option	Description
---user <name>	Username to create (sudo-enabled)
---ssh-port <port>	SSH port to use (default: 2222)
---pubkey "<key>"	Public SSH key to install for the new user
---generate-key	Generate a new ed25519 keypair on the server
---role bastion	Configure as bastion (SSH only)
---role general	Configure as general server (SSH + HTTP/HTTPS)
---allow-ssh-from <ip>	Restrict SSH access to given IP/CIDR (recommended for general servers)
---enable-crowdsec	Install CrowdSec for community-driven protection
+- Creates user `admin`
+- Sets SSH to port `2222`
+- Only allows SSH **from your bastion’s IP**
+- Opens ports 80/443 (HTTP/HTTPS) by default
 
-🖥️ Client-Side Setup (~/.ssh/config)
+---
+
+## 🔑 Options
+
+| Option                  | Description                                                                  |
+|-------------------------|------------------------------------------------------------------------------|
+| `--user <name>`         | Username to create (sudo-enabled)                                            |
+| `--ssh-port <port>`     | SSH port to use (default: 2222)                                              |
+| `--pubkey "<key>"`      | Public SSH key to install for the new user                                   |
+| `--generate-key`        | Generate a new ed25519 keypair on the server                                 |
+| `--role bastion`        | Configure as bastion (SSH only)                                              |
+| `--role general`        | Configure as general server (SSH + HTTP/HTTPS)                               |
+| `--allow-ssh-from <ip>` | Restrict SSH access to given IP/CIDR (recommended for general servers)       |
+| `--enable-crowdsec`     | Install CrowdSec for community-driven protection                              |
+
+---
+
+## 🖥️ Client-Side Setup (`~/.ssh/config`)
+
 On your workstation, configure SSH shortcuts for easier access:
 
-ssh
-Copy
-Host bastion
-    HostName <bastion-ip>
-    User admin
-    Port 2222
-    IdentityFile ~/.ssh/id_ed25519_bastion
-    ServerAliveInterval 60
-    ServerAliveCountMax 2
+    Host bastion
+        HostName <bastion-ip>
+        User admin
+        Port 2222
+        IdentityFile ~/.ssh/id_ed25519_bastion
+        ServerAliveInterval 60
+        ServerAliveCountMax 2
 
-Host big
-    HostName <big-server-ip>
-    User admin
-    Port 2222
-    ProxyJump bastion
-    IdentityFile ~/.ssh/id_ed25519_big
-    ServerAliveInterval 60
-    ServerAliveCountMax 2
+    Host big
+        HostName <big-server-ip>
+        User admin
+        Port 2222
+        ProxyJump bastion
+        IdentityFile ~/.ssh/id_ed25519_big
+        ServerAliveInterval 60
+        ServerAliveCountMax 2
+
 Then you can connect with:
 
-bash
-Copy
-ssh bastion
-ssh big   # automatically jumps through bastion
-🔍 Security Tools Installed
-UFW: simple firewall with defaults (deny inbound, allow outbound)
+    ssh bastion
+    ssh big   # automatically jumps through bastion
 
-Fail2ban: bans brute force login attempts
+---
 
-Unattended Upgrades: keeps security patches up to date
+## 🔍 Security Tools Installed
 
-Auditd: logs critical system events
+- **UFW**: simple firewall with defaults (deny inbound, allow outbound)
+- **Fail2ban**: bans brute force login attempts
+- **Unattended Upgrades**: keeps security patches up to date
+- **Auditd**: logs critical system events
+- **Lynis**: performs security auditing (`lynis audit system`)
+- **CrowdSec (optional)**: blocks malicious IPs using shared community intelligence
 
-Lynis: performs security auditing (lynis audit system)
+---
 
-CrowdSec (optional): blocks malicious IPs using shared community intelligence
+## ⚠️ Notes
+- Run on a **fresh server** to avoid conflicts.
+- Always back up the generated private keys securely.
+- Test your SSH connection on the new port before closing your existing session.
+- For production, restrict SSH to bastion-only (`--allow-ssh-from <bastion-ip>`).
 
-⚠️ Notes
-Run on a fresh server to avoid conflicts.
+---
 
-Always back up the generated private keys securely.
-
-Test your SSH connection on the new port before closing your existing session.
-
-For production, restrict SSH to bastion-only (--allow-ssh-from <bastion-ip>).
-
-📝 License
+## 📝 License
 MIT License
