@@ -14,13 +14,20 @@ SSH_PORT="${SSH_PORT:-2222}"
 NEW_USER=""
 PUBKEY=""
 GENERATE_KEY="false"
-PRINT_PRIVATE_KEY="true"    # print generated private key at the end
+
+# Per your request: keep printing private key if generated.
+PRINT_PRIVATE_KEY="true"
+
 ROLE="general"              # bastion|general
 ALLOW_SSH_FROM=""           # comma-separated list of IPv4/IPv6 CIDRs or IPs
 ENABLE_CROWDSEC="false"
 PURGE_MTA="false"
 AUTO_REBOOT="false"         # unattended-upgrades auto reboot at 03:30 if true
 KEEP_SSH_22="false"         # keep port 22 open after port change, for safe cutover
+
+# Advanced CrowdSec handling
+CROWDSEC_FORCE_TAINTED="true"      # force-enable tainted items (safe for idempotent infra-as-code)
+CROWDSEC_ALLOW_REPO_ADD="true"     # add official CrowdSec repo if bouncer packages missing
 
 usage() {
   cat <<EOF
@@ -37,7 +44,7 @@ Usage:
 
 Notes:
   - PasswordAuthentication will be disabled ONLY if authorized_keys is non-empty.
-  - When --generate-key is used, the private key will be printed at the end.
+  - When --generate-key is used, the private key will be generated and printed.
 EOF
 }
 
@@ -84,7 +91,7 @@ echo "[*] Installing base security tools..."
 apt-get install -y \
   sudo ufw fail2ban curl wget git unzip ca-certificates \
   unattended-upgrades apt-listchanges bsd-mailx \
-  auditd audispd-plugins lynis whois openssh-server
+  auditd audispd-plugins lynis whois openssh-server gnupg
 
 ########################
 # Optional: MTA purge  #
@@ -383,42 +390,91 @@ lynis audit system --quick || true
 # CrowdSec (optional)  #
 ########################
 if [[ "$ENABLE_CROWDSEC" == "true" ]]; then
-  echo "[*] Installing CrowdSec engine + firewall bouncer..."
+  echo "[*] Installing CrowdSec engine..."
   apt-get update -y
   apt-get install -y crowdsec || true
 
   if command -v cscli >/dev/null 2>&1; then
     systemctl enable --now crowdsec || true
-    cscli hub update || true
-    cscli collections install crowdsecurity/linux crowdsecurity/sshd || true
-    systemctl reload crowdsec || true
 
-    # Prefer nftables bouncer, fallback to iptables
-    if ! apt-get install -y crowdsec-firewall-bouncer-nftables; then
-      echo "[!] nftables bouncer failed; falling back to iptables bouncer."
-      apt-get install -y crowdsec-firewall-bouncer-iptables || true
+    cscli hub update || true
+
+    # Handle tainted collections robustly
+    if [[ "$CROWDSEC_FORCE_TAINTED" == "true" ]]; then
+      cscli collections install crowdsecurity/linux --force || true
+      cscli collections install crowdsecurity/sshd  --force || true
+    else
+      cscli collections upgrade crowdsecurity/linux || true
+      cscli collections install crowdsecurity/linux || true
+      cscli collections install crowdsecurity/sshd  || true
     fi
 
-    BCFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
-    if [[ -f "$BCFG" ]] && grep -q '^api_key:' "$BCFG"; then
-      echo "[*] Existing bouncer API key found; reusing."
-    else
-      API_KEY="$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)"
-      if [[ -n "${API_KEY:-}" ]]; then
-        if grep -q '^api_key:' "$BCFG" 2>/dev/null; then
-          sed -i "s/^api_key:.*/api_key: ${API_KEY}/" "$BCFG"
-        else
-          printf "api_key: %s\n" "$API_KEY" >> "$BCFG"
-        fi
+    systemctl reload crowdsec || true
+
+    # --- Firewall bouncer install strategy ---
+    want_nft="false"
+    command -v nft >/dev/null 2>&1 && want_nft="true"
+
+    install_bouncer_pkg() {
+      local ok="false"
+      if [[ "$want_nft" == "true" ]]; then
+        apt-get install -y crowdsec-firewall-bouncer-nftables && ok="true" || true
+      fi
+      if [[ "$ok" != "true" ]]; then
+        apt-get install -y crowdsec-firewall-bouncer-iptables && ok="true" || true
+      fi
+      if [[ "$ok" != "true" ]]; then
+        apt-get install -y crowdsec-firewall-bouncer && ok="true" || true
+      fi
+      [[ "$ok" == "true" ]]
+    }
+
+    if ! install_bouncer_pkg; then
+      if [[ "$CROWDSEC_ALLOW_REPO_ADD" == "true" ]]; then
+        echo "[i] Adding official CrowdSec APT repo to obtain firewall bouncer..."
+        apt-get install -y curl ca-certificates gnupg || true
+        curl -fsSL https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash || true
+        apt-get update -y
+        install_bouncer_pkg || echo "[!] Bouncer packages still unavailable after adding repo."
       else
-        echo "[!] Failed to obtain bouncer API key."
+        echo "[!] Bouncer package(s) not found in current repos and repo-add disabled; continuing without bouncer."
       fi
     fi
 
-    systemctl enable --now crowdsec-firewall-bouncer || true
+    BCFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+    HAVE_API_KEY="false"
+    if [[ -f "$BCFG" ]]; then
+      if ! grep -qE '^api_key:\s*\S' "$BCFG"; then
+        echo "[*] Creating firewall bouncer API key..."
+        API_KEY="$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)"
+        if [[ -n "${API_KEY:-}" ]]; then
+          if grep -q '^api_key:' "$BCFG" 2>/dev/null; then
+            sed -i "s/^api_key:.*/api_key: ${API_KEY}/" "$BCFG"
+          else
+            printf "api_key: %s\n" "$API_KEY" >> "$BCFG"
+          fi
+          HAVE_API_KEY="true"
+        else
+          echo "[!] Failed to obtain bouncer API key."
+        fi
+      else
+        HAVE_API_KEY="true"
+      fi
+    fi
+
+    # Enable bouncer only if unit exists and we have an API key
+    if systemctl list-unit-files | grep -q '^crowdsec-firewall-bouncer\.service'; then
+      if [[ "$HAVE_API_KEY" == "true" ]]; then
+        systemctl enable --now crowdsec-firewall-bouncer || true
+      else
+        echo "[!] Skipping bouncer enable: missing API key."
+      fi
+    else
+      echo "[!] Bouncer systemd unit not present; skipping enable."
+    fi
 
     echo "[*] CrowdSec status:"
-    cscli metrics show || true
+    cscli metrics || true
     cscli decisions list || true
   else
     echo "[!] cscli not found; CrowdSec engine may not have installed correctly."
@@ -439,7 +495,7 @@ if [[ "$KEEP_SSH_22" == "true" ]]; then
   echo "[i] Port 22 is currently kept open for safety. After verifying access on port $SSH_PORT, you should close port 22:"
   echo "    sudo ufw delete allow 22/tcp"
 fi
-if [[ -f "$KEY_PATH" && "$GENERATE_KEY" == "true" ]]; then
+if [[ -f "$KEY_PATH" && "$GENERATE_KEY" == "true" && "$PRINT_PRIVATE_KEY" == "true" ]]; then
   echo
   echo "==== PRIVATE KEY (copy and store securely) ===="
   cat "$KEY_PATH"
