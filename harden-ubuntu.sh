@@ -2,19 +2,6 @@
 set -euo pipefail
 set -o errtrace
 
-# Ultimate Ubuntu hardening script (bastion or general)
-# Changes:
-# - Reliable CrowdSec ENGINE + bouncer install + API key wire-up
-# - Stronger SSH hardening (extra strict for --role bastion)
-# - Auditd baseline rules
-# - Kernel/sysctl hardening
-# - PAM/password policy + tighter umask
-# - Legal banners (no info leaks)
-# - Fail2ban: bantime increment + recidive
-# - Optional MTA purge (postfix), or harden if present
-# - Optional unattended-upgrades auto-reboot
-# - Safer key handling (no private key printed by default)
-
 trap 'echo "[!] Error on line $LINENO. Aborting."; exit 1' ERR
 
 ########################
@@ -27,28 +14,30 @@ SSH_PORT="${SSH_PORT:-2222}"
 NEW_USER=""
 PUBKEY=""
 GENERATE_KEY="false"
-PRINT_PRIVATE_KEY="false"   # safer default = false
+PRINT_PRIVATE_KEY="true"    # print generated private key at the end
 ROLE="general"              # bastion|general
 ALLOW_SSH_FROM=""           # comma-separated list of IPv4/IPv6 CIDRs or IPs
 ENABLE_CROWDSEC="false"
 PURGE_MTA="false"
 AUTO_REBOOT="false"         # unattended-upgrades auto reboot at 03:30 if true
+KEEP_SSH_22="false"         # keep port 22 open after port change, for safe cutover
 
 usage() {
   cat <<EOF
 Usage:
   $0 --user <name>
      [--ssh-port 2222]
-     [--pubkey "<ssh-ed25519 ...>"] [--generate-key] [--print-private-key]
+     [--pubkey "<ssh-ed25519 ...>"] [--generate-key]
      [--role bastion|general]
      [--allow-ssh-from "<IP/CIDR>[,<IP6/CIDR6>...]"]
      [--enable-crowdsec]
-     [--purge-mta]            # purge postfix if present
-     [--auto-reboot]          # unattended-upgrades auto reboot at 03:30
+     [--purge-mta]
+     [--auto-reboot]
+     [--keep-ssh-22]
 
-Examples:
-  bash $0 --user admin --ssh-port 2222 --generate-key --role bastion --enable-crowdsec --purge-mta
-  bash $0 --user admin --role general --allow-ssh-from 203.0.113.10,2001:db8::/32
+Notes:
+  - PasswordAuthentication will be disabled ONLY if authorized_keys is non-empty.
+  - When --generate-key is used, the private key will be printed at the end.
 EOF
 }
 
@@ -58,12 +47,12 @@ while [[ $# -gt 0 ]]; do
     --ssh-port) SSH_PORT="$2"; shift 2;;
     --pubkey) PUBKEY="$2"; shift 2;;
     --generate-key) GENERATE_KEY="true"; shift 1;;
-    --print-private-key) PRINT_PRIVATE_KEY="true"; shift 1;;
     --role) ROLE="$2"; shift 2;;
     --allow-ssh-from) ALLOW_SSH_FROM="$2"; shift 2;;
     --enable-crowdsec) ENABLE_CROWDSEC="true"; shift 1;;
     --purge-mta) PURGE_MTA="true"; shift 1;;
     --auto-reboot) AUTO_REBOOT="true"; shift 1;;
+    --keep-ssh-22) KEEP_SSH_22="true"; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
@@ -79,6 +68,7 @@ echo "[*] SSH port: $SSH_PORT"
 [[ "$ENABLE_CROWDSEC" == "true" ]] && echo "[*] CrowdSec: enabled"
 [[ "$PURGE_MTA" == "true" ]] && echo "[*] Will purge local MTA if found (postfix)"
 [[ "$AUTO_REBOOT" == "true" ]] && echo "[*] Unattended upgrades will auto-reboot nightly"
+[[ "$KEEP_SSH_22" == "true" ]] && echo "[*] Will keep port 22 open for safe cutover"
 
 ########################
 # System updates       #
@@ -94,7 +84,7 @@ echo "[*] Installing base security tools..."
 apt-get install -y \
   sudo ufw fail2ban curl wget git unzip ca-certificates \
   unattended-upgrades apt-listchanges bsd-mailx \
-  auditd audispd-plugins lynis whois
+  auditd audispd-plugins lynis whois openssh-server
 
 ########################
 # Optional: MTA purge  #
@@ -106,7 +96,6 @@ if [[ "$PURGE_MTA" == "true" ]]; then
     apt-get autoremove -y
   fi
 else
-  # If postfix is present, harden banner + disable VRFY
   if dpkg -s postfix >/dev/null 2>&1; then
     echo "[*] Hardening postfix banner + disabling VRFY..."
     postconf -e 'smtpd_banner=$myhostname ESMTP'
@@ -135,36 +124,73 @@ chown -R "$NEW_USER:$NEW_USER" "$USER_HOME/.ssh"
 ########################
 # Handle key material  #
 ########################
+KEY_PATH="$USER_HOME/.ssh/id_ed25519"
 if [[ -n "$PUBKEY" ]]; then
   echo "[*] Installing provided public key for $NEW_USER"
-  if ! grep -qF "$PUBKEY" "$USER_HOME/.ssh/authorized_keys"; then
+  if ! grep -qxF "$PUBKEY" "$USER_HOME/.ssh/authorized_keys"; then
     echo "$PUBKEY" >> "$USER_HOME/.ssh/authorized_keys"
+  else
+    echo "[*] Provided public key already present in authorized_keys."
   fi
 elif [[ "$GENERATE_KEY" == "true" ]]; then
-  KEY_PATH="$USER_HOME/.ssh/id_ed25519"
   if [[ -f "$KEY_PATH" ]]; then
     echo "[*] Key already exists at $KEY_PATH (skipping generation)."
   else
     echo "[*] Generating ed25519 keypair for $NEW_USER (no passphrase)..."
     sudo -u "$NEW_USER" ssh-keygen -t ed25519 -N "" -f "$KEY_PATH"
-    cat "${KEY_PATH}.pub" >> "$USER_HOME/.ssh/authorized_keys"
+    # Add pubkey to authorized_keys if not present
+    if ! grep -qxF "$(cat "${KEY_PATH}.pub")" "$USER_HOME/.ssh/authorized_keys"; then
+      cat "${KEY_PATH}.pub" >> "$USER_HOME/.ssh/authorized_keys"
+    fi
     chmod 600 "$KEY_PATH" "${KEY_PATH}.pub"
     chown "$NEW_USER:$NEW_USER" "$KEY_PATH" "${KEY_PATH}.pub"
-    if [[ "$PRINT_PRIVATE_KEY" == "true" ]]; then
-      echo
-      echo "==== PRIVATE KEY (copy and store securely) ===="
-      cat "$KEY_PATH"
-      echo "==== END PRIVATE KEY =========================="
-      echo
-    else
-      echo "[i] Private key stored at $KEY_PATH (not printed)."
-      echo "[i] Copy it out with (example):"
-      echo "    scp -P $SSH_PORT $NEW_USER@\$(curl -4 -s ifconfig.co):$KEY_PATH ~/.ssh/id_ed25519_${NEW_USER}"
-    fi
   fi
 else
   echo "[*] No public key provided and --generate-key not set. Add a key before disabling password auth."
 fi
+
+########################
+# UFW firewall (pre-SSH) #
+########################
+echo "[*] Configuring UFW (preparing SSH cutover)..."
+# Ensure IPv6 is enabled
+if grep -q '^IPV6=' /etc/default/ufw; then
+  sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+else
+  echo 'IPV6=yes' >> /etc/default/ufw
+fi
+
+# Initialize UFW (idempotent)
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+
+# Allow SSH on new port (from given sources if provided)
+if [[ -n "$ALLOW_SSH_FROM" ]]; then
+  IFS=',' read -r -a sources <<<"$ALLOW_SSH_FROM"
+  for src in "${sources[@]}"; do
+    ufw allow from "$src" to any port "$SSH_PORT" proto tcp || true
+  done
+else
+  ufw allow "$SSH_PORT"/tcp || true
+fi
+
+# Optionally keep port 22 open for cutover safety
+if [[ "$KEEP_SSH_22" == "true" ]]; then
+  ufw allow 22/tcp || true
+fi
+
+# Open HTTP/HTTPS on general role
+if [[ "$ROLE" == "general" ]]; then
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
+fi
+
+# Rate-limit SSH
+ufw limit "$SSH_PORT"/tcp || true
+
+ufw --force enable
+ufw status verbose || true
 
 ########################
 # SSH hardening        #
@@ -173,10 +199,9 @@ echo "[*] Hardening SSH configuration..."
 SSHD="/etc/ssh/sshd_config"
 [[ ! -f "${SSHD}.bak" ]] && cp "$SSHD" "${SSHD}.bak"
 
-# Base secure settings
+# Base secure settings (port first)
 sed -i -E "s/^#?Port .*/Port $SSH_PORT/" "$SSHD"
 sed -i -E "s/^#?PermitRootLogin .*/PermitRootLogin no/" "$SSHD"
-sed -i -E "s/^#?PasswordAuthentication .*/PasswordAuthentication no/" "$SSHD"
 sed -i -E "s/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/" "$SSHD"
 sed -i -E "s/^#?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/" "$SSHD"
 sed -i -E "s/^#?X11Forwarding .*/X11Forwarding no/" "$SSHD"
@@ -186,7 +211,7 @@ grep -qE "^ClientAliveCountMax" "$SSHD" || echo "ClientAliveCountMax 2" >> "$SSH
 grep -qE "^UseDNS" "$SSHD" || echo "UseDNS no" >> "$SSHD"
 grep -qE "^AuthenticationMethods" "$SSHD" || echo "AuthenticationMethods publickey" >> "$SSHD"
 
-# Banner (legal, non-informative)
+# Legal banner (non-informative)
 if ! grep -q "^Banner " "$SSHD"; then
   echo "Banner /etc/issue.net" >> "$SSHD"
 fi
@@ -216,44 +241,24 @@ if [[ "$ROLE" == "bastion" ]]; then
   add_or_replace "MaxSessions" "2"
 fi
 
+# Disable password auth ONLY if keys are present
+if [[ -s "$USER_HOME/.ssh/authorized_keys" ]]; then
+  sed -i -E "s/^#?PasswordAuthentication .*/PasswordAuthentication no/" "$SSHD"
+  echo "[*] PasswordAuthentication disabled (authorized_keys not empty)."
+else
+  echo "[!] No keys present; leaving PasswordAuthentication enabled to avoid lockout."
+  sed -i -E "s/^#?PasswordAuthentication .*/PasswordAuthentication yes/" "$SSHD"
+fi
+
+# Validate sshd config before reload
+if ! sshd -t 2>/dev/null; then
+  echo "[!] sshd config test failed; restoring backup."
+  cp "${SSHD}.bak" "$SSHD"
+  exit 1
+fi
+
+# Apply SSH changes
 systemctl reload ssh || systemctl restart ssh
-
-########################
-# UFW firewall         #
-########################
-echo "[*] Configuring UFW..."
-# Ensure IPv6 is enabled
-if grep -q '^IPV6=' /etc/default/ufw; then
-  sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
-else
-  echo 'IPV6=yes' >> /etc/default/ufw
-fi
-
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-# Allow SSH (from given sources if provided)
-if [[ -n "$ALLOW_SSH_FROM" ]]; then
-  IFS=',' read -r -a sources <<<"$ALLOW_SSH_FROM"
-  for src in "${sources[@]}"; do
-    ufw allow from "$src" to any port "$SSH_PORT" proto tcp || true
-  done
-else
-  ufw allow "$SSH_PORT"/tcp
-fi
-
-# Open HTTP/HTTPS on general role
-if [[ "$ROLE" == "general" ]]; then
-  ufw allow 80/tcp || true
-  ufw allow 443/tcp || true
-fi
-
-# Rate-limit SSH
-ufw limit "$SSH_PORT"/tcp || true
-
-ufw --force enable
-ufw status verbose
 
 ########################
 # Fail2ban             #
@@ -318,7 +323,7 @@ else
   echo 'UMASK		027' >> /etc/login.defs
 fi
 
-# Ensure pwquality in common-password (idempotent best-effort)
+# Ensure pwquality in common-password (best-effort)
 if grep -q 'pam_pwquality.so' /etc/pam.d/common-password; then
   sed -i -E 's#(pam_pwquality\.so).*#\1 retry=3 minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1#g' /etc/pam.d/common-password
 else
@@ -339,7 +344,7 @@ cat >/etc/audit/rules.d/10-hardening.rules <<'EOF'
 -w /etc/shadow -p wa -k identity
 -w /etc/sudoers -p wa -k scope
 -w /etc/ssh/sshd_config -p wa -k sshd
-# Process exec tracking
+# Process exec tracking (verbose; consider narrowing for prod)
 -a always,exit -F arch=b64 -S execve -k exec
 -a always,exit -F arch=b32 -S execve -k exec
 EOF
@@ -359,6 +364,7 @@ fs.protected_regular=2
 net.ipv4.conf.all.log_martians=1
 net.ipv4.conf.default.log_martians=1
 net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.default.accept_source_route=0
 net.ipv4.conf.default.accept_redirects=0
@@ -378,27 +384,34 @@ lynis audit system --quick || true
 ########################
 if [[ "$ENABLE_CROWDSEC" == "true" ]]; then
   echo "[*] Installing CrowdSec engine + firewall bouncer..."
-  # Install from repo (more reliable on 22.04/24.04 than the bootstrapper)
   apt-get update -y
-  apt-get install -y crowdsec crowdsec-firewall-bouncer-iptables || true
+  apt-get install -y crowdsec || true
 
   if command -v cscli >/dev/null 2>&1; then
     systemctl enable --now crowdsec || true
     cscli hub update || true
-    # baseline collections
     cscli collections install crowdsecurity/linux crowdsecurity/sshd || true
     systemctl reload crowdsec || true
 
-    # Register bouncer and write API key to bouncer config
-    API_KEY="$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)"
-    if [[ -n "${API_KEY:-}" ]]; then
-      BCFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
-      if [[ -f "$BCFG" ]]; then
-        if grep -q '^api_key:' "$BCFG"; then
+    # Prefer nftables bouncer, fallback to iptables
+    if ! apt-get install -y crowdsec-firewall-bouncer-nftables; then
+      echo "[!] nftables bouncer failed; falling back to iptables bouncer."
+      apt-get install -y crowdsec-firewall-bouncer-iptables || true
+    fi
+
+    BCFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+    if [[ -f "$BCFG" ]] && grep -q '^api_key:' "$BCFG"; then
+      echo "[*] Existing bouncer API key found; reusing."
+    else
+      API_KEY="$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null || true)"
+      if [[ -n "${API_KEY:-}" ]]; then
+        if grep -q '^api_key:' "$BCFG" 2>/dev/null; then
           sed -i "s/^api_key:.*/api_key: ${API_KEY}/" "$BCFG"
         else
-          echo "api_key: ${API_KEY}" >> "$BCFG"
+          printf "api_key: %s\n" "$API_KEY" >> "$BCFG"
         fi
+      else
+        echo "[!] Failed to obtain bouncer API key."
       fi
     fi
 
@@ -422,8 +435,44 @@ echo "[*] Completed hardening for role: $ROLE"
 echo "[*] SSH is on port: $SSH_PORT"
 [[ -n "$ALLOW_SSH_FROM" ]] && echo "[*] SSH allowed only from: $ALLOW_SSH_FROM"
 echo "[*] Connect like:  ssh -p $SSH_PORT $NEW_USER@$IP"
-if [[ "$GENERATE_KEY" == "true" && "$PRINT_PRIVATE_KEY" != "true" ]]; then
-  echo "[*] Copy your key (example):"
-  echo "    scp -P $SSH_PORT $NEW_USER@$IP:$USER_HOME/.ssh/id_ed25519 ~/.ssh/id_ed25519_${NEW_USER}"
+if [[ "$KEEP_SSH_22" == "true" ]]; then
+  echo "[i] Port 22 is currently kept open for safety. After verifying access on port $SSH_PORT, you should close port 22:"
+  echo "    sudo ufw delete allow 22/tcp"
+fi
+if [[ -f "$KEY_PATH" && "$GENERATE_KEY" == "true" ]]; then
+  echo
+  echo "==== PRIVATE KEY (copy and store securely) ===="
+  cat "$KEY_PATH"
+  echo "==== END PRIVATE KEY =========================="
+  echo
+  echo "[i] The matching public key is at: ${KEY_PATH}.pub"
 fi
 echo "=============================================================="
+
+cat <<'EONEXT'
+Next steps (do these NOW, before logging out):
+
+1) From your workstation, copy the private key (if generated here) into a local file, e.g.:
+   - Save it as ~/.ssh/id_ed25519_<user> with permissions 600:
+     chmod 600 ~/.ssh/id_ed25519_<user>
+
+   OR, if you didn't generate a key here, ensure your workstation's public key
+   is in /home/<user>/.ssh/authorized_keys on the server.
+
+2) Open a NEW terminal and test logging in on the NEW port:
+   ssh -i ~/.ssh/id_ed25519_<user> -p <port> <user>@<server-ip>
+
+3) If login works, and you used --keep-ssh-22, close port 22:
+   sudo ufw delete allow 22/tcp
+
+4) OPTIONAL: If PasswordAuthentication is still enabled because no keys were found,
+   add a key to authorized_keys and then you may disable password auth by setting:
+   PasswordAuthentication no
+   in /etc/ssh/sshd_config, then:
+   sudo sshd -t && sudo systemctl reload ssh
+
+Tips:
+- Keep an active root/session open while testing the new port.
+- Store your private key securely; do not share it; consider a passphrase on workstation keys.
+- For CrowdSec+Fail2ban duplication: it's fine, but you can remove one to simplify ops.
+EONEXT
